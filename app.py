@@ -9,7 +9,68 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import warnings
+import time
+import random
 warnings.filterwarnings("ignore")
+
+# ─── Rate-limit-safe yfinance wrapper ─────────────────────────────────────────
+def _yf_fetch_with_retry(ticker_bk, max_retries=4):
+    """
+    Fetch yfinance data with exponential backoff + jitter.
+    Handles Yahoo Finance 429 / Too Many Requests gracefully.
+    """
+    for attempt in range(max_retries):
+        try:
+            # Random small delay before every request (0.3–1.2s)
+            time.sleep(random.uniform(0.3, 1.2))
+            tk = yf.Ticker(ticker_bk)
+
+            # .info triggers the main API call — wrap separately
+            info = {}
+            try:
+                info = tk.info or {}
+            except Exception as e:
+                if "429" in str(e) or "Too Many" in str(e):
+                    raise e   # let outer handler retry
+                info = {}
+
+            # history
+            hist = pd.DataFrame()
+            try:
+                hist = tk.history(period="2y")
+            except Exception:
+                pass
+
+            # financials  
+            financials = balance = cashflow = pd.DataFrame()
+            try:
+                time.sleep(random.uniform(0.2, 0.6))
+                financials = tk.financials
+            except Exception:
+                pass
+            try:
+                time.sleep(random.uniform(0.2, 0.6))
+                balance = tk.balance_sheet
+            except Exception:
+                pass
+            try:
+                time.sleep(random.uniform(0.2, 0.6))
+                cashflow = tk.cashflow
+            except Exception:
+                pass
+
+            return info, hist, financials, balance, cashflow
+
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "Too Many" in err_str or "rate" in err_str.lower():
+                wait = (2 ** attempt) + random.uniform(1, 3)   # 2s, 5s, 11s, 19s
+                st.warning(f"⏳ Yahoo Finance rate limit hit — waiting {wait:.0f}s before retry {attempt+1}/{max_retries}…")
+                time.sleep(wait)
+            else:
+                raise e
+
+    raise Exception(f"Failed to fetch {ticker_bk} after {max_retries} retries due to rate limiting. Please wait 1–2 minutes and try again.")
 
 # ─── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -298,18 +359,9 @@ def ticker_to_bk(t):
         t = t + ".BK"
     return t
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)   # cache 30 min → fewer repeat calls
 def fetch_stock(ticker_bk):
-    tk = yf.Ticker(ticker_bk)
-    info = tk.info
-    hist = tk.history(period="2y")
-    try:
-        financials = tk.financials          # IS (annual)
-        balance    = tk.balance_sheet       # BS (annual)
-        cashflow   = tk.cashflow            # CF (annual)
-    except:
-        financials = balance = cashflow = pd.DataFrame()
-    return info, hist, financials, balance, cashflow
+    return _yf_fetch_with_retry(ticker_bk)
 
 def build_assumptions(info, financials, balance, cashflow):
     """Extract last fiscal year actuals + set default projections"""
@@ -1012,12 +1064,28 @@ if st.session_state["loaded"]:
 
             peer_data = []
             prog = st.progress(0)
+            status_txt = st.empty()
+
+            def _fetch_peer_info(ptk, retries=3):
+                for attempt in range(retries):
+                    try:
+                        time.sleep(random.uniform(0.8, 2.0))
+                        return yf.Ticker(ptk).info or {}
+                    except Exception as e:
+                        if "429" in str(e) or "Too Many" in str(e):
+                            wait = (2 ** attempt) + random.uniform(1, 4)
+                            time.sleep(wait)
+                        else:
+                            return {}
+                return {}
+
             for i, ptk in enumerate(peer_list):
                 prog.progress((i + 1) / len(peer_list))
+                status_txt.caption(f"Fetching {ptk} ({i+1}/{len(peer_list)})...")
+                pi = _fetch_peer_info(ptk)
+                if not pi:
+                    continue
                 try:
-                    pi = yf.Ticker(ptk).info
-                    if not pi:
-                        continue
                     peer_data.append({
                         "Ticker":     ptk.replace(".BK", ""),
                         "Name":       (pi.get("shortName") or ptk)[:25],
@@ -1034,6 +1102,7 @@ if st.session_state["loaded"]:
                 except:
                     pass
             prog.empty()
+            status_txt.empty()
 
             if peer_data:
                 peer_df = pd.DataFrame(peer_data)
